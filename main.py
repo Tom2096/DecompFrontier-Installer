@@ -210,7 +210,7 @@ class FetchWindowsSDKTools:
 
     def _findSDKTools(self) -> tuple[Path | None, Path | None]:
         sdkRoot = self._findWindowsSDK()
-        if not sdkRoot:
+        if not sdkRoot or not (sdkRoot / "bin").exists():
             return None, None
 
         hasVersioned = any(

@@ -1,0 +1,10 @@
+# Visual Studio Code local settings
+.vscode/*
+
+# Exception: If you want to share recommended extensions or task settings
+# !.vscode/extensions.json
+# !.vscode/tasks.json
+
+# Ignore history and workspace storage
+.history/
+*.code-workspace
