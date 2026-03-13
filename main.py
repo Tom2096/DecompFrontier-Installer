@@ -187,6 +187,16 @@ class FetchWindowsSDKTools:
         self.ctx = ctx
 
     def _findWindowsSDK(self) -> Path | None:
+
+        roots = [
+            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
+            / "Windows Kits"
+            / "10",
+            Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+            / "Windows Kits"
+            / "10",
+        ]
+
         key = r"SOFTWARE\Microsoft\Windows Kits\Installed Roots"
         try:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
@@ -194,11 +204,15 @@ class FetchWindowsSDKTools:
                     try:
                         val, _ = winreg.QueryValueEx(k, name)
                         if val and Path(val).exists():
-                            return Path(val)
+                            roots.append(Path(val))
                     except FileNotFoundError:
                         pass
         except FileNotFoundError:
             return None
+
+        for root in roots:
+            if (root / "bin").exists():
+                return root
         return None
 
     _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")

@@ -1,0 +1,22 @@
+[2026-03-01 00:21:55] Starting installation...
+[2026-03-01 00:21:57] Download started for build\libcurl.dll
+[2026-03-01 00:21:58] Downloading...
+[2026-03-01 00:21:58] From: https://github.com/Tom2096/offline-proxy-fork/releases/download/v0.0.1/libcurl.dll
+[2026-03-01 00:21:58] To: C:\Users\the20\Desktop\BF\DecompFrontier-Installer\build\libcurl.dll
+[2026-03-01 00:21:58] 0%|                                                                                                                                     | 0.00/3.62M [00:00<?, ?B/s]
+[2026-03-01 00:21:58] 100%|############################################################################################################################| 3.62M/3.62M [00:00<00:00, 15.3MB/s]
+[2026-03-01 00:21:58] 0%|                                                                                                                                     | 0.00/3.62M [00:00<?, ?B/s]
+[2026-03-01 00:21:58] Download complete: build\libcurl.dll
+[2026-03-01 00:21:58] 0%|                                                                                                                                     | 0.00/3.62M [00:00<?, ?B/s]
+[2026-03-01 00:21:58] Found makeappx.exe at C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe
+[2026-03-01 00:21:58] 0%|                                                                                                                                     | 0.00/3.62M [00:00<?, ?B/s]
+[2026-03-01 00:21:58] Found signtool.exe at C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+[2026-03-01 00:22:00] Certificate created with thumbprint: 7DB18EFD4750FA97E70A708B5A750969E795AF93
+[2026-03-01 00:22:00] Exporting certificate to build/myKey.pfx...
+[2026-03-01 00:22:00] Successfully exported certificate to build\myKey.pfx
+[2026-03-01 00:22:00] Cleaning up certificate from store...
+[2026-03-01 00:22:00] Successfully cleaned up cert: 7DB18EFD4750FA97E70A708B5A750969E795AF93
+[2026-03-01 00:22:00] 
+IMPORTANT! You should now follow the 'Installing the Certificate' section from the link below to verify the generated certificate: https://decompfrontier.github.io/pages/Tutorial/dev-client-winrt.html. Your key file is located at:
+C:\Users\the20\Desktop\BF\DecompFrontier-Installer\build\myKey.pfx
+
