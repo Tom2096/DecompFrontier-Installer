@@ -560,11 +560,13 @@ class SetupGameServer:
 
         self.ctx.logger(Logline(f"Extracting server assets to {dest}..."))
 
+        self.ctx.logger(Logline(f"file {source}"))
         with zipfile.ZipFile(source, "r") as z:
             with z.open("assets.zip") as assets:
                 bytes = io.BytesIO(assets.read())
                 with zipfile.ZipFile(bytes) as inner:
                     for file in z.infolist():
+                        self.ctx.logger(Logline(f"file {file}"))
                         if file.filename.startswith(("content/", "mst/")):
                             inner.extract(file, dest)
 
