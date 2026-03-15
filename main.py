@@ -1,12 +1,13 @@
-import cmd
 import io
+import ctypes
+import time
+import webbrowser
 import subprocess
 from dataclasses import dataclass
 import queue
 import re
 from typing import Any
 import os
-import stat
 import shutil
 import datetime
 import sys
@@ -39,6 +40,7 @@ CONFIG = {
         "SAVE_DIR": "build",
         "UNPACK_DIR": "build/BraveFrontierAppxClient",
         "PATCHED_PATH": "build/BraveFrontierPatched.appx",
+        "DEP": "https://raw.githubusercontent.com/M1k3G0/Win10_LTSC_VP9_Installer/master/Microsoft.VCLibs.120.00_12.0.21005.1_x86__8wekyb3d8bbwe.appx",
     },
     "ASSETS": {
         "URL": "https://drive.google.com/uc?export=download&id=1ApVcJISPovYuWEidnkkTJi_NI8sD1Xmx",
@@ -137,12 +139,27 @@ def download(ctx: Context, url: str, dest: Path) -> None:
     sys.stdout = stream
     sys.stderr = stream
 
-    gdown.download(url, output=str(dest), quiet=False)
+    try:
+        gdown.download(url, output=str(dest), quiet=False)
+    except Exception as e:
+        ctx.logger(Logline(f"Gdown failed: {e}"))
+        ctx.logger(Logline("Attempting browser fallback..."))
 
-    sys.stdout = old_stdout
-    sys.stderr = old_stderr
+        # Convert gdown URL format to a direct browser link if necessary
+        # Or just use the URL provided in the error
+        webbrowser.open(url)
 
-    ctx.logger(Logline(f"Download complete: {dest}"))
+        message = (
+            "Host has refused an automated download request,"
+            f" please download the file manually and place it at {dest}"
+        )
+        raise RuntimeError(message)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    if dest.exists():
+        ctx.logger(Logline(f"Download complete: {dest}"))
 
 
 def runSubprocess(ctx: Context, cmd: list[str], **kwargs: Any) -> int:
@@ -384,6 +401,37 @@ class GenerateDeveloperCert:
             )
         )
 
+    def _installToTrustedRoot(self) -> None:
+        keyPath = Path(CONFIG["CERT_PATH"]).absolute()
+        scriptPath = os.path.join(os.getcwd(), "_install_cert.ps1")
+
+        script = (
+            f'$pw = ConvertTo-SecureString -String "{self.ctx.certPassword}" -Force -AsPlainText; '
+            f'Import-PfxCertificate -FilePath "{keyPath}" '
+            f'-CertStoreLocation "Cert:\\LocalMachine\\Root" -Password $pw'
+        )
+
+        with open(scriptPath, "w", encoding="utf-8") as f:
+            f.write(script)
+        try:
+            self.ctx.logger(
+                Logline(f"Placing certificate into trusted directory...")
+            )
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                "powershell.exe",
+                f'-NoProfile -ExecutionPolicy Bypass -File "{scriptPath}"',
+                None,
+                1,
+            )
+            if rc <= 32:
+                raise RuntimeError(f"Elevation failed (RC: {rc})")
+            time.sleep(2)
+        finally:
+            if os.path.exists(scriptPath):
+                os.remove(scriptPath)
+
         # Deletes the cert from the virtual 'Personal' store
         cleanup_cmd = f'Remove-Item -Path "Cert:\\CurrentUser\\My\\{self.thumbprint}" -ErrorAction SilentlyContinue'
 
@@ -398,15 +446,7 @@ class GenerateDeveloperCert:
         self.ctx.logger(header="Generating developer certificate...")
         self._createCert()
         self._exportCert()
-
-        message = (
-            "\nIMPORTANT! "
-            "You should now follow the 'Installing the Certificate' section "
-            "from the link below to verify the generated certificate: "
-            "https://decompfrontier.github.io/pages/Tutorial/dev-client-winrt.html. "
-            f"Your key file is located at:\n{Path(CONFIG['CERT_PATH']).absolute()}\n"
-        )
-        self.ctx.logger(Logline(message))
+        self._installToTrustedRoot()
 
 
 class PatchGameClient:
@@ -524,6 +564,54 @@ class PatchGameClient:
 
         self.ctx.patchedAppxPath = Path(CONFIG["APPX"]["PATCHED_PATH"])
 
+    def _installDependencies(self) -> None:
+        vclibs_path = (
+            Path(CONFIG["APPX"]["SAVE_DIR"]) / "Microsoft.VCLibs.x86.appx"
+        )
+
+        download(self.ctx, CONFIG["APPX"]["DEP"], vclibs_path)
+
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f'Add-AppxPackage "{vclibs_path.absolute()}"',
+        ]
+
+        self.ctx.logger(Logline("Installing VCLibs dependency..."))
+        if runSubprocess(self.ctx, cmd) != 0:
+            # We don't necessarily want to CRASH if this fails, because the user
+            # might already have it installed.
+            self.ctx.logger(
+                Logline(
+                    "VCLibs install returned non-zero. This is usually fine if already installed."
+                )
+            )
+        else:
+            self.ctx.logger(
+                Logline("VCLibs dependency installed successfully!")
+            )
+
+    def _installGameClient(self) -> None:
+        patched_path = Path(CONFIG["APPX"]["PATCHED_PATH"]).absolute()
+
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f'Add-AppxPackage "{patched_path}"',
+        ]
+
+        self.ctx.logger(Logline(f"Installing the patched client..."))
+        if runSubprocess(self.ctx, cmd) != 0:
+            raise RuntimeError(
+                f"Failed to install patched game client, please uninstall"
+                " any existing game clients before restarting this setup script"
+            )
+        self.ctx.logger(Logline("Game client installed successfully!"))
+
     def run(self) -> Exception | None:
         assert (
             self.ctx.offlineproxyPath and self.ctx.offlineproxyPath.exists()
@@ -547,6 +635,8 @@ class PatchGameClient:
         self._unpackAppx(dest)
         self._patchAppx()
         self._packAppx()
+        self._installDependencies()
+        self._installGameClient()
 
 
 class SetupGameServer:
@@ -611,6 +701,12 @@ class SetupGameServer:
 
         self.ctx.logger(header="Installing game server...")
 
+        # Clean up any previous export directory to ensure a fresh start.
+        exportDir = Path(CONFIG["SERVER"]["EXPORT_DIR"])
+        if exportDir.exists():
+            self.ctx.logger(Logline("Cleaning up previous export directory..."))
+            shutil.rmtree(exportDir)
+
         dest = CONFIG["ASSETS"]["SAVE_DIR"] + "/21900.zip"
         self.ctx.logger(
             Logline("Downloading server assets, this may take a while...")
@@ -657,6 +753,7 @@ class CredentialsDialog(tk.Toplevel):
         tk.Label(self, text="Common Name (CN):").pack(pady=(15, 0))
         self.name_entry = tk.Entry(self, width=35)
         self.name_entry.insert(0, "BraveFrontier")
+        self.name_entry.config(state="disabled")
         self.name_entry.pack(pady=5)
 
         tk.Label(self, text="Private Key Password:").pack(pady=(10, 0))
@@ -808,33 +905,9 @@ class App:
             SetupOfflineProxy,
             FetchWindowsSDKTools,
             GenerateDeveloperCert,
+            PatchGameClient,
+            SetupGameServer,
         ]:
-            try:
-                work(ctx=ctx).run()
-            except Exception as e:
-                self.logger(Logline(f"Error: {e}"))
-                errored = True
-                break
-
-        if errored:
-            self.btn.config(
-                state="normal", text="Finish", command=self.root.quit
-            )
-            return
-
-        # We will wait for the user to verify the cert installation via
-        # the Windows GUI.
-        self.btn.config(
-            state="normal",
-            text="I have verified the certificate",
-            width=30,
-            command=self.continueEvent.set,
-        )
-        self.continueEvent.wait()
-        self.continueEvent.clear()
-        self.btn.config(state="disabled")
-
-        for work in [PatchGameClient, SetupGameServer]:
             try:
                 work(ctx=ctx).run()
             except Exception as e:
@@ -853,16 +926,13 @@ class App:
 
         message = (
             "\nYou have now completed the entire installation process of DecompFrontier! "
-            "You should now be able to install the patched client APPX in "
-            f"{ctx.patchedAppxPath.absolute()}. "
             f"You can launch the server at {ctx.serverBinaryPath.absolute()}. "
             "It is highly recommended to read and follow the 'Connecting to the Server' section "
-            "in https://decompfrontier.github.io/pages/Tutorial/dev-client-winrt.html "
+            "in https://decompfrontier.github.io/pages/Tutorial/dev-client-winrt.html#connecting-to-the-server "
             "to understand how to connect the client to the server. \n"
             "\nPlease direct all questions, issues, and feedback to the DecompFrontier discord server. "
             "Thank you for using this installer, and have fun! :)"
         )
-
         if not errored:
             self.logger(Logline(message))
 

@@ -1,4 +1,4 @@
-('C:\\Users\\the20\\Desktop\\BF\\Client\\build\\DecompInstaller\\PYZ-00.pyz',
+('C:\\Users\\the20\\Desktop\\BF\\DecompFrontier-Installer\\build\\DecompInstaller\\PYZ-00.pyz',
  [('IPython',
    'C:\\Apps\\Miniconda\\envs\\frida-env\\lib\\site-packages\\IPython\\__init__.py',
    'PYMODULE'),

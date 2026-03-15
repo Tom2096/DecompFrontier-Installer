@@ -8,3 +8,7 @@
 # Ignore history and workspace storage
 .history/
 *.code-workspace
+
+# Ignore local builds
+.build/*
+.dist/*
