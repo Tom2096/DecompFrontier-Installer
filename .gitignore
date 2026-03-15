@@ -10,5 +10,5 @@
 *.code-workspace
 
 # Ignore local builds
-.build/*
-.dist/*
+build/*
+dist/*
