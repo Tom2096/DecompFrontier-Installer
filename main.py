@@ -24,7 +24,10 @@ import zipfile
 import gdown
 
 LOGGER = Callable[..., None]
-
+# Number of seconds to sleep for before running subprocess.Popen.
+# This is to avoid collision issues with shared libraries in-between
+# multiple calls.
+BUFFER = 2
 CONFIG = {
     "LOG_DIR": "runs",
     "PROXY_DLL": {
@@ -48,9 +51,9 @@ CONFIG = {
         "EXPORT_DIR": "deploy/game_content",
     },
     "SERVER": {
-        "OWNER": "Tom2096",
+        "OWNER": "Seltraeh",
         "REPO": "server",
-        "TAG": "v0.0.1",
+        "TAG": "Mission-and-Units-v1.0",
         "SAVE_DIR": "build",
         "EXPORT_DIR": "deploy",
     },
@@ -124,8 +127,10 @@ def fetchGithubRelease(releaseApi: str) -> tuple[str, str]:
     return name, url
 
 
-def download(ctx: Context, url: str, dest: Path) -> None:
-    if dest.exists():
+def download(
+    ctx: Context, url: str, dest: Path, overwrite: bool = False
+) -> None:
+    if dest.exists() and not overwrite:
         ctx.logger(Logline(f"File already exists at {dest}, skipping download"))
         return
 
@@ -163,6 +168,7 @@ def download(ctx: Context, url: str, dest: Path) -> None:
 
 
 def runSubprocess(ctx: Context, cmd: list[str], **kwargs: Any) -> int:
+    time.sleep(BUFFER)
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -427,7 +433,7 @@ class GenerateDeveloperCert:
             )
             if rc <= 32:
                 raise RuntimeError(f"Elevation failed (RC: {rc})")
-            time.sleep(2)
+            time.sleep(BUFFER)
         finally:
             if os.path.exists(scriptPath):
                 os.remove(scriptPath)
@@ -726,7 +732,8 @@ class SetupGameServer:
         )
         name, url = fetchGithubRelease(releaseApi)
         dest = Path(CONFIG["SERVER"]["SAVE_DIR"]) / name
-        download(self.ctx, url, dest)
+        # Overwrite the server to pull new updates
+        download(self.ctx, url, dest, overwrite=True)
 
         self._extractServer(dest)
         self.ctx.logger(Logline(f"Server setup complete!"))
