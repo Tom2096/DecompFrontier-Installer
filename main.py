@@ -1,4 +1,3 @@
-import io
 import ctypes
 import time
 import webbrowser
@@ -13,7 +12,7 @@ import datetime
 import sys
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import threading
 import json
 from typing import Callable
@@ -28,6 +27,7 @@ LOGGER = Callable[..., None]
 # This is to avoid collision issues with shared libraries in-between
 # multiple calls.
 BUFFER = 2
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CONFIG = {
     "LOG_DIR": "runs",
     "PROXY_DLL": {
@@ -46,14 +46,14 @@ CONFIG = {
         "DEP": "https://raw.githubusercontent.com/M1k3G0/Win10_LTSC_VP9_Installer/master/Microsoft.VCLibs.120.00_12.0.21005.1_x86__8wekyb3d8bbwe.appx",
     },
     "ASSETS": {
-        "URL": "https://drive.google.com/uc?export=download&id=1ApVcJISPovYuWEidnkkTJi_NI8sD1Xmx",
+        "URL": "https://pub-4d7a00307627488aa260526c1e97239f.r2.dev/assets.zip",
         "SAVE_DIR": "build",
         "EXPORT_DIR": "deploy/game_content",
     },
     "SERVER": {
         "OWNER": "Seltraeh",
         "REPO": "server",
-        "TAG": "Mission-and-Units-v1.0",
+        "TAG": "Open-Alpha",
         "SAVE_DIR": "build",
         "EXPORT_DIR": "deploy",
     },
@@ -169,10 +169,12 @@ def download(
 
 def runSubprocess(ctx: Context, cmd: list[str], **kwargs: Any) -> int:
     time.sleep(BUFFER)
+    creationFlags = kwargs.pop("creationflags", 0) | CREATE_NO_WINDOW
     p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        creationflags=creationFlags,
         **kwargs,
     )
     stream = StreamToLogger(ctx)
@@ -356,6 +358,9 @@ class GenerateDeveloperCert:
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
         "-Command",
     ]
 
@@ -375,6 +380,7 @@ class GenerateDeveloperCert:
             check=True,
             encoding="utf-8",
             capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
         )
         assert (
             p.stdout
@@ -427,9 +433,10 @@ class GenerateDeveloperCert:
                 None,
                 "runas",
                 "powershell.exe",
-                f'-NoProfile -ExecutionPolicy Bypass -File "{scriptPath}"',
+                f'-NoProfile -ExecutionPolicy Bypass -NonInteractive '
+                f'-WindowStyle Hidden -File "{scriptPath}"',
                 None,
-                1,
+                0,
             )
             if rc <= 32:
                 raise RuntimeError(f"Elevation failed (RC: {rc})")
@@ -652,18 +659,31 @@ class SetupGameServer:
     def _extractAssets(self) -> None:
         dest = Path(CONFIG["ASSETS"]["EXPORT_DIR"])
         dest.mkdir(parents=True, exist_ok=True)
-        source = CONFIG["ASSETS"]["SAVE_DIR"] + "/21900.zip"
+        source = Path(CONFIG["ASSETS"]["SAVE_DIR"]) / "assets.zip"
 
         self.ctx.logger(Logline(f"Extracting server assets to {dest}..."))
 
         with zipfile.ZipFile(source, "r") as z:
-            with z.open("assets.zip") as assets:
-                # Wrap the bytes so zipfile can treat it like a file
-                bytes_data = io.BytesIO(assets.read())
-                with zipfile.ZipFile(bytes_data) as inner:
-                    for file_info in inner.infolist():
-                        if file_info.filename.startswith(("content/", "mst/")):
-                            inner.extract(file_info, dest)
+            for fileInfo in z.infolist():
+                parts = Path(fileInfo.filename.replace("\\", "/")).parts
+                if len(parts) < 3 or parts[0] != "assets":
+                    continue
+                if parts[1] not in ("content", "mst"):
+                    continue
+                if any(part in ("", ".", "..") for part in parts):
+                    raise RuntimeError(
+                        f"Unsafe path in assets archive: {fileInfo.filename}"
+                    )
+
+                target = dest.joinpath(*parts[1:])
+                if fileInfo.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(fileInfo, "r") as sourceFile:
+                    with target.open("wb") as targetFile:
+                        shutil.copyfileobj(sourceFile, targetFile)
 
         self.ctx.logger(Logline(f"Successfully extracted assets to {dest}"))
 
@@ -713,11 +733,11 @@ class SetupGameServer:
             self.ctx.logger(Logline("Cleaning up previous export directory..."))
             shutil.rmtree(exportDir)
 
-        dest = CONFIG["ASSETS"]["SAVE_DIR"] + "/21900.zip"
+        dest = Path(CONFIG["ASSETS"]["SAVE_DIR"]) / "assets.zip"
         self.ctx.logger(
             Logline("Downloading server assets, this may take a while...")
         )
-        download(self.ctx, CONFIG["ASSETS"]["URL"], Path(dest))
+        download(self.ctx, CONFIG["ASSETS"]["URL"], dest)
 
         self._extractAssets()
 
@@ -843,17 +863,45 @@ class App:
         # updates for progress lines (clearLine=True).
         self.prevLog = None
 
-        # Set up logging directory with timestamped log file.
-        id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        logDir = Path(CONFIG["LOG_DIR"])
-        self.logPath = logDir / f"{id}.log"
-        Path(CONFIG["LOG_DIR"]).mkdir(parents=True, exist_ok=True)
+        self.installDir: Path | None = None
+        self.logPath: Path | None = None
 
         # Used to pause/unpause during the installation process.
         self.continueEvent = threading.Event()
 
     def start(self):
+        initialDir = (
+            Path(sys.executable).parent
+            if getattr(sys, "frozen", False)
+            else Path.cwd()
+        )
+        selectedDir = filedialog.askdirectory(
+            parent=self.root,
+            title="Select DecompFrontier installation folder",
+            initialdir=str(initialDir),
+            mustexist=True,
+        )
+        if not selectedDir:
+            return
+
+        self.installDir = Path(selectedDir).resolve()
+        try:
+            os.chdir(self.installDir)
+            logDir = Path(CONFIG["LOG_DIR"])
+            logDir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror(
+                "Invalid Installation Folder",
+                f"The selected folder cannot be used:\n\n{e}",
+                parent=self.root,
+            )
+            return
+
+        logId = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.logPath = logDir / f"{logId}.log"
+
         self.btn.config(state="disabled")
+        self.logger(Logline(f"Installation folder: {self.installDir}"))
         self.logger(Logline("Starting installation..."))
         threading.Thread(target=self.worker, daemon=True).start()
 
@@ -864,6 +912,7 @@ class App:
             if (
                 not log.clearLine
             ):  # Only write to log file if not a progress update
+                assert self.logPath, "Log path must be set before logging"
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 with self.logPath.open("a", encoding="utf-8") as f:
                     if self.prevLog and self.prevLog.clearLine:

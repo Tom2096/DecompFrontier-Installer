@@ -3,12 +3,12 @@
 For most users, using the pre-compiled binary is the simplest method:
 
 1. **Download**: Grab the latest `DecompInstaller.exe` from the [Releases](https://github.com/Tom2096/DecompFrontier-Installer/releases/tag/V0.0.1) page.
-2. **Placement**: Move the `.exe` into any folder of your choice (e.g., `C:\Games\BraveFrontier`).
-3. **Run**: Double-click the installer. 
+2. **Run**: Place the `.exe` wherever convenient and double-click it.
+3. **Choose a destination**: Press **Start**, then select the folder where DecompFrontier should be installed (e.g., `C:\Games\BraveFrontier`).
 
 ### Notes:
 * You do not need to install Python or any external tools manually.
-* On its first run, the installer will automatically download all necessary dependencies, libraries, and game files into the folder where the `.exe` is located.
+* On its first run, the installer will automatically download all necessary dependencies, libraries, and game files into the folder you selected.
 * If you encounter an error, simply review the log for details and restart the installer. If any packages or dependencies were successfully downloaded during a previous attempt, the installer will detect them and skip those steps.
 
 ### ⚠️ CRITICAL: Post Installation
