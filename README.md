@@ -2,7 +2,7 @@
 
 For most users, using the pre-compiled binary is the simplest method:
 
-1. **Download**: Grab the latest `DecompInstaller.exe` from the [Releases](https://github.com/Tom2096/DecompFrontier-Installer/releases/tag/V0.0.1) page.
+1. **Download**: Grab the latest `DecompInstaller.exe` from the [Releases](https://github.com/Tom2096/DecompFrontier-Installer/releases/tag/v0.0.3) page.
 2. **Run**: Place the `.exe` wherever convenient and double-click it.
 3. **Choose a destination**: Press **Start**, then select the folder where DecompFrontier should be installed (e.g., `C:\Games\BraveFrontier`).
 
