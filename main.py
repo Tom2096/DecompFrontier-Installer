@@ -39,7 +39,7 @@ CONFIG = {
     "WINDOWS_SDK_ID": "Microsoft.WindowsSDK.10.0.26100",
     "CERT_PATH": "build/myKey.pfx",
     "APPX": {
-        "URL": "https://drive.google.com/uc?export=download&id=1NB64gzQOe-QQx9fY0mkoZiCSfe3WlTYi",
+        "URL": "https://pub-4d7a00307627488aa260526c1e97239f.r2.dev/client.appx",
         "SAVE_DIR": "build",
         "UNPACK_DIR": "build/BraveFrontierAppxClient",
         "PATCHED_PATH": "build/BraveFrontierPatched.appx",
@@ -127,12 +127,30 @@ def fetchGithubRelease(releaseApi: str) -> tuple[str, str]:
     return name, url
 
 
+def remoteSize(url: str) -> int | None:
+    # Content-Length from a HEAD request, or None when the host does not say.
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": "SimpleDownloader"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            size = r.headers.get("Content-Length")
+            return int(size) if size and size.isdigit() else None
+    except Exception:
+        return None
+
+
 def download(
     ctx: Context, url: str, dest: Path, overwrite: bool = False
 ) -> None:
     if dest.exists() and not overwrite:
-        ctx.logger(Logline(f"File already exists at {dest}, skipping download"))
-        return
+        # A file kept from an earlier run is reused only while it still matches
+        # the hosted copy, so re-running the installer picks up updated files.
+        size = remoteSize(url)
+        if size is None or size == dest.stat().st_size:
+            ctx.logger(Logline(f"File already exists at {dest}, skipping download"))
+            return
+        ctx.logger(Logline(f"{dest} differs from the hosted copy, downloading the new one"))
 
     ctx.logger(Logline(f"Download started for {dest}"))
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -663,6 +681,7 @@ class SetupGameServer:
 
         self.ctx.logger(Logline(f"Extracting server assets to {dest}..."))
 
+        extracted = 0
         with zipfile.ZipFile(source, "r") as z:
             for fileInfo in z.infolist():
                 parts = Path(fileInfo.filename.replace("\\", "/")).parts
@@ -684,8 +703,16 @@ class SetupGameServer:
                 with z.open(fileInfo, "r") as sourceFile:
                     with target.open("wb") as targetFile:
                         shutil.copyfileobj(sourceFile, targetFile)
+                extracted += 1
 
-        self.ctx.logger(Logline(f"Successfully extracted assets to {dest}"))
+        # An archive without the assets/ prefix extracts nothing; the server would
+        # then start with no game files, so stop here instead of reporting success.
+        if extracted == 0:
+            raise RuntimeError(
+                f"{source} contained no assets/content or assets/mst files;"
+                " delete it and run the installer again to download a fresh copy."
+            )
+        self.ctx.logger(Logline(f"Successfully extracted {extracted} asset files to {dest}"))
 
     def _extractServer(self, source: Path) -> None:
         dest = Path(CONFIG["SERVER"]["EXPORT_DIR"])
@@ -727,9 +754,22 @@ class SetupGameServer:
 
         self.ctx.logger(header="Installing game server...")
 
-        # Clean up any previous export directory to ensure a fresh start.
+        # Clean up any previous export directory to ensure a fresh start, but keep
+        # the player's save (gme.sqlite and its journal files): it is copied into
+        # build/save_backups first and put back after the new server is extracted.
         exportDir = Path(CONFIG["SERVER"]["EXPORT_DIR"])
+        savedFiles: list[tuple[Path, Path]] = []
         if exportDir.exists():
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backupDir = Path(CONFIG["SERVER"]["SAVE_DIR"]) / "save_backups" / stamp
+            for name in ("gme.sqlite", "gme.sqlite-wal", "gme.sqlite-shm"):
+                saveFile = exportDir / name
+                if saveFile.exists():
+                    backupDir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(saveFile, backupDir / name)
+                    savedFiles.append((backupDir / name, saveFile))
+            if savedFiles:
+                self.ctx.logger(Logline(f"Backed up your save to {backupDir}"))
             self.ctx.logger(Logline("Cleaning up previous export directory..."))
             shutil.rmtree(exportDir)
 
@@ -756,6 +796,10 @@ class SetupGameServer:
         download(self.ctx, url, dest, overwrite=True)
 
         self._extractServer(dest)
+        for backup, original in savedFiles:
+            shutil.copy2(backup, original)
+        if savedFiles:
+            self.ctx.logger(Logline("Restored your save into the new server."))
         self.ctx.logger(Logline(f"Server setup complete!"))
 
 
