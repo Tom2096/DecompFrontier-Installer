@@ -80,6 +80,10 @@ CONFIG = {
             ],
             "SHA256": "f1302e899f015818b1b807f7a1dc44c221c184e3f34a19fe81b5874d4ab974bd",
             "SAVE_PATH": "build/Microsoft.VCLibs.x86.appx",
+            # The game imports these, and Windows supplies them only from this
+            # package, to the installed app. An .exe started from a folder
+            # fails with "msvcr120_app.dll was not found".
+            "DLLS": ("msvcr120_app.dll", "msvcp120_app.dll", "vccorlib120_app.dll"),
         },
     },
     "ASSETS": {
@@ -112,6 +116,7 @@ class Context:
     certThumbprint: str | None = None
     installedVersion: tuple[int, ...] | None = None
     clientCurrent: bool = False
+    otherClients: list[str] | None = None
     patchedAppxPath: Path | None = None
     serverBinaryPath: Path | None = None
     saveBackupDir: Path | None = None
@@ -499,6 +504,75 @@ def installedClient() -> tuple[tuple[int, ...], Path] | None:
         return None
 
 
+def clientProblem(expectedVersion: str | None = None) -> str | None:
+    # Why the client this installer made cannot start, or None when it can: its
+    # package must be registered and healthy, and its VCLibs framework must
+    # hold the DLLs the game imports.
+    dep = CONFIG["APPX"]["DEP"]
+    publisher = "CN=" + CONFIG["CERT"]["NAME"]
+    dlls = ", ".join(psQuote(d) for d in dep["DLLS"])
+    p = powershell(
+        f"$g = Get-AppxPackage -Name {psQuote(CONFIG['APPX']['NAME'])} | "
+        f"Where-Object {{ $_.Publisher -eq {psQuote(publisher)} }} | Select-Object -First 1; "
+        "if (-not $g) { 'state=missing'; return }; "
+        "'version=' + [string]$g.Version; 'status=' + [string]$g.Status; "
+        f"$v = @($g.Dependencies) | Where-Object {{ $_.Name -eq {psQuote(dep['NAME'])} }} | Select-Object -First 1; "
+        "if (-not $v) { 'dependency=missing'; return }; "
+        "'dependency=' + [string]$v.Status; "
+        f"foreach ($d in @({dlls})) {{ if (-not (Test-Path -LiteralPath (Join-Path ([string]$v.InstallLocation) $d))) {{ 'missingdll=' + $d }} }}"
+    )
+    facts: dict[str, list[str]] = {}
+    for line in p.stdout.splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep:
+            facts.setdefault(key, []).append(value)
+    if not facts:
+        return f"Windows did not report the installed client ({(p.stderr or 'no output').strip()})"
+    if "state" in facts:
+        return "Brave Frontier is not installed"
+    version = facts.get("version", ["?"])[0]
+    if expectedVersion and version != expectedVersion:
+        return f"version {version} is installed instead of {expectedVersion}"
+    status = facts.get("status", ["?"])[0]
+    if status != "Ok":
+        return f"its package status is {status}"
+    depStatus = facts.get("dependency", ["missing"])[0]
+    if depStatus == "missing":
+        return f"its {dep['NAME']} dependency is not registered"
+    if depStatus != "Ok":
+        return f"its {dep['NAME']} dependency's status is {depStatus}"
+    if "missingdll" in facts:
+        return f"{', '.join(facts['missingdll'])} missing from {dep['NAME']}"
+    return None
+
+
+def otherClientCopies() -> list[str]:
+    # Brave Frontier packages from another publisher (not made by this
+    # installer). They cannot reach the offline server, but share the name.
+    publisher = "CN=" + CONFIG["CERT"]["NAME"]
+    p = powershell(
+        f"Get-AppxPackage -Name {psQuote(CONFIG['APPX']['NAME'])} | "
+        f"Where-Object {{ $_.Publisher -ne {psQuote(publisher)} }} | "
+        "ForEach-Object { [string]$_.PackageFullName }"
+    )
+    return [line.strip() for line in p.stdout.splitlines() if line.strip()]
+
+
+def removeUnpackedClient(ctx: Context) -> None:
+    # The unpacked client is only a step towards the signed package. Its
+    # BraveFrontier.Windows.exe cannot start outside the installed app, so it
+    # is not left where a player could double-click it.
+    unpackDir = Path(CONFIG["APPX"]["UNPACK_DIR"])
+    if unpackDir.exists():
+        shutil.rmtree(unpackDir, ignore_errors=True)
+        ctx.logger(
+            Logline(
+                f"Removed the unpacked client in {unpackDir} (the game starts only"
+                " from the Start menu)"
+            )
+        )
+
+
 def isLoopbackExempt(family: str) -> bool:
     p = subprocess.run(
         ["CheckNetIsolation.exe", "LoopbackExempt", "-s"],
@@ -639,6 +713,19 @@ class CheckInstalledClient:
 
     def run(self) -> None:
         self.ctx.logger(header="Checking the installed client...")
+        removeUnpackedClient(self.ctx)  # left behind by earlier installers
+
+        others = otherClientCopies()
+        if others:
+            self.ctx.otherClients = others
+            for name in others:
+                self.ctx.logger(
+                    Logline(
+                        f"Warning: another Brave Frontier is installed ({name}). It was"
+                        " not made by this installer and cannot reach your server."
+                    )
+                )
+
         found = installedClient()
         if not found:
             self.ctx.logger(Logline("Brave Frontier is not installed yet."))
@@ -655,21 +742,29 @@ class CheckInstalledClient:
             current = False
 
         if current:
-            self.ctx.clientCurrent = True
+            problem = clientProblem()
+            if not problem:
+                self.ctx.clientCurrent = True
+                self.ctx.logger(
+                    Logline(
+                        f"The installed client ({shown}) already has the current"
+                        " offline proxy, so the client steps are skipped."
+                    )
+                )
+                return
             self.ctx.logger(
                 Logline(
-                    f"The installed client ({shown}) already has the current offline"
-                    " proxy, so the client steps are skipped."
+                    f"The installed client ({shown}) cannot start ({problem}). It will"
+                    " be installed again, keeping its downloaded game data."
                 )
             )
-            return
-
-        self.ctx.logger(
-            Logline(
-                f"The installed client ({shown}) has an older offline proxy. It will"
-                " be updated in place, keeping its downloaded game data."
+        else:
+            self.ctx.logger(
+                Logline(
+                    f"The installed client ({shown}) has an older offline proxy. It"
+                    " will be updated in place, keeping its downloaded game data."
+                )
             )
-        )
         if runningProcessPaths(CONFIG["APPX"]["PROCESS"]):
             raise RuntimeError("Close Brave Frontier, then run the installer again.")
 
@@ -914,6 +1009,7 @@ def nextClientVersion(manifestVersion: str, installed: tuple[int, ...] | None) -
 class PatchGameClient:
     def __init__(self, ctx: Context):
         self.ctx = ctx
+        self.version: str | None = None  # the package version being installed
 
     def _unpackAppx(self, appxPath: Path) -> None:
         # Clean up any previous unpacked client to ensure a fresh start.
@@ -975,6 +1071,7 @@ class PatchGameClient:
         if not identity:
             raise RuntimeError("No package version found in the client's manifest!")
         version = nextClientVersion(identity.group(2), self.ctx.installedVersion)
+        self.version = version
         manifest = (
             manifest[: identity.start(2)] + version + manifest[identity.end(2) :]
         )
@@ -1032,10 +1129,16 @@ class PatchGameClient:
         self.ctx.patchedAppxPath = Path(CONFIG["APPX"]["PATCHED_PATH"])
 
     def _dependencyInstalled(self) -> bool:
+        # Registered, healthy, and actually holding the DLLs the game imports.
         dep = CONFIG["APPX"]["DEP"]
+        files = " -and ".join(
+            f"(Test-Path -LiteralPath (Join-Path ([string]$_.InstallLocation) {psQuote(d)}))"
+            for d in dep["DLLS"]
+        )
         p = powershell(
             f"@(Get-AppxPackage -Name {psQuote(dep['NAME'])} | Where-Object {{"
             f" [string]$_.Architecture -eq 'X86' -and [version]$_.Version -ge [version]{psQuote(dep['MIN_VERSION'])}"
+            f" -and [string]$_.Status -eq 'Ok' -and {files}"
             " }).Count"
         )
         count = p.stdout.strip()
@@ -1059,9 +1162,12 @@ class PatchGameClient:
         ]
 
         self.ctx.logger(Logline("Installing VCLibs dependency..."))
-        if runSubprocess(self.ctx, cmd) != 0 and not self._dependencyInstalled():
+        runSubprocess(self.ctx, cmd)
+        if not self._dependencyInstalled():
             raise RuntimeError(
-                f"Windows could not install {dep['NAME']}, which the game needs."
+                f"Windows could not install {dep['NAME']} (x86), which the game needs"
+                " (it provides msvcr120_app.dll and vccorlib120_app.dll). The reason"
+                " is in the lines above."
             )
         self.ctx.logger(Logline("VCLibs dependency installed successfully!"))
 
@@ -1084,7 +1190,14 @@ class PatchGameClient:
                 " did not make is installed, uninstall it, then run the installer"
                 " again."
             )
-        self.ctx.logger(Logline("Game client installed successfully!"))
+        # Add-AppxPackage succeeding is not proof the game can start: check the
+        # registered package and the DLLs its framework supplies.
+        problem = clientProblem(self.version)
+        if problem:
+            raise RuntimeError(
+                f"Windows reports the game as installed, but it cannot start: {problem}."
+            )
+        self.ctx.logger(Logline(f"Game client {self.version} installed and checked!"))
 
     def run(self) -> Exception | None:
         assert (
@@ -1108,6 +1221,7 @@ class PatchGameClient:
         self._unpackAppx(appxPath)
         self._patchAppx()
         self._packAppx()
+        removeUnpackedClient(self.ctx)
         self._installDependencies()
         self._installGameClient()
 
@@ -1564,7 +1678,17 @@ class App:
             f"1. Start the server: open {launch.absolute()} and leave its window open"
             " while you play.\n"
             "2. Start Brave Frontier from the Start menu. The first start downloads the"
-            " game data from your server, which can take 30 minutes or more.\n"
+            " game data from your server, which can take 30 minutes or more. (Opening"
+            " a BraveFrontier.Windows.exe file directly fails with \"msvcr120_app.dll"
+            " was not found\": Windows supplies that DLL only to the installed app.)\n"
+            + (
+                "\nAnother Brave Frontier, not made by this installer, is also installed"
+                " and cannot reach your server. To remove it, run this in PowerShell:\n"
+                + "\n".join(f"  Remove-AppxPackage {name}" for name in ctx.otherClients)
+                + "\n"
+                if ctx.otherClients
+                else ""
+            )
             + (
                 f"Your save was kept; a copy is in {ctx.saveBackupDir.absolute()}.\n"
                 if ctx.saveBackupDir

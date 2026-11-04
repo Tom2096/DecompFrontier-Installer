@@ -22,6 +22,10 @@ Windows asks once for administrator permission during the install. That one prom
 
 Run the installer again and choose the same folder. It downloads only what changed. Your save (`deploy\gme.sqlite`) is kept, and a copy goes to `build\save_backups`. If the client is already current, the client steps are skipped. If only the offline proxy changed, the client is updated in place and keeps its downloaded game data.
 
+### "msvcr120_app.dll / vccorlib120_app.dll was not found"
+
+These DLLs come from Microsoft's VCLibs 12.0 package, and Windows provides them only to the **installed** app. Start the game from the Start menu, not by opening a `BraveFrontier.Windows.exe` file. If the Start menu entry shows the error too, run the installer again: it checks that the installed game and its VCLibs package are complete, and reinstalls them if not.
+
 ### Troubleshooting & Persistence
 
 Most often, the source of an error will be clear from reading the installation log. If you need assistance:
