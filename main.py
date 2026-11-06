@@ -4,8 +4,10 @@ import traceback
 import webbrowser
 import subprocess
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes
 from dataclasses import dataclass
+import gzip
 import hashlib
 import queue
 import re
@@ -93,6 +95,31 @@ CONFIG = {
         "SIZE_GUESS": 3.5 * GB,
         "CONTENT_SUBDIR": "game_content",
     },
+    "CONTENT_UPDATE": {
+        # The published list of every game content file (path, size, SHA-256,
+        # cache form) and the files themselves, each stored once under its
+        # SHA-256. A re-run downloads only what differs from the player's copy,
+        # instead of the whole assets.zip. Optional: without the list, the
+        # content from assets.zip is used as it is. Built by
+        # scripts/content_manifest.py (server repository).
+        "MANIFEST_URLS": [f"{R2}/content/manifest.json.gz"],
+        "FILES_BASE": f"{R2}/files/",
+        "MANIFEST_PATH": "build/content_manifest.json.gz",
+        "STATE_PATH": "build/content_state.json",
+        "WORKERS": 6,
+    },
+    "SEED": {
+        # Pre-loading the game's cache: which form the client stores each content
+        # file in (as served, or FileCrypt-scrambled), recorded per file name from
+        # a cache the client filled itself (Settings > Full Download). Optional:
+        # when it cannot be downloaded the game downloads its files as before.
+        "MAP_URLS": [f"{R2}/seed/700fd0dc/seed_map.json.gz"],
+        "MAP_SHA256": "700fd0dc78c24d6540823821942389a413b8912f10fcfb771f13613ece1098e0",
+        "MAP_PATH": "build/seed_map.json.gz",
+        "STATE_PATH": "build/seed_state.json",
+        # Room left free after pre-loading.
+        "FREE_MARGIN": 1 * GB,
+    },
     "SERVER": {
         "URLS": [
             "https://github.com/Seltraeh/server/releases/download/Open-Alpha/server.zip"
@@ -120,6 +147,11 @@ class Context:
     patchedAppxPath: Path | None = None
     serverBinaryPath: Path | None = None
     saveBackupDir: Path | None = None
+    # Files the game's cache now holds from pre-loading (0 = not pre-loaded).
+    seededFiles: int = 0
+    # The published content list, when UpdateGameContent could download it:
+    # {"content/<path>": [size, sha256, cache form or None]}.
+    contentManifest: dict | None = None
 
 
 @dataclass
@@ -1497,6 +1529,456 @@ class SetupGameServer:
         self.ctx.logger(Logline(f"Server setup complete!"))
 
 
+class UpdateGameContent:
+    # Brings deploy\game_content up to the published content list: only files
+    # whose SHA-256 differs from the list are downloaded, each from
+    # <FILES_BASE><sha256>, checked, and swapped in whole. A file that cannot be
+    # downloaded keeps its old version and is tried again on the next run; files
+    # the list does not name (a player's own additions) are left alone.
+    # Optional: any problem leaves the content from assets.zip as it is.
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:
+            self.ctx.logger(
+                Logline(f"Could not check for game content updates ({e}); the installed content is used as it is.")
+            )
+
+    def _loadManifest(self) -> dict | None:
+        cfg = CONFIG["CONTENT_UPDATE"]
+        dest = Path(cfg["MANIFEST_PATH"])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        for url in cfg["MANIFEST_URLS"]:
+            try:
+                # Always fetched again: the list changes with every update.
+                dest.unlink(missing_ok=True)
+                _fetch(self.ctx, url, dest)
+                data = json.loads(gzip.decompress(dest.read_bytes()))
+                if data.get("format") == 1 and isinstance(data.get("files"), dict):
+                    return data["files"]
+                self.ctx.logger(Logline(f"The content list from {url} is not in a known format"))
+            except Exception as e:
+                self.ctx.logger(Logline(f"The content list is not available from {url} ({e})"))
+        return None
+
+    @staticmethod
+    def _safe(rel: str) -> bool:
+        parts = rel.split("/")
+        return (
+            len(parts) >= 2
+            and parts[0] in ("content", "mst")
+            and all(p not in ("", ".", "..") and ":" not in p and "\\" not in p for p in parts)
+        )
+
+    def _download(self, url: str, sha: str, dest: Path) -> int:
+        last: Exception | None = None
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            try:
+                with httpRequest(url, timeout=60) as r:
+                    data = r.read()
+                if hashlib.sha256(data).hexdigest() != sha:
+                    raise RuntimeError("not the expected file (checksum mismatch)")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                part = dest.with_name(dest.name + ".part")
+                part.write_bytes(data)
+                os.replace(part, dest)
+                return len(data)
+            except urllib.error.HTTPError as e:
+                last = RuntimeError(f"HTTP {e.code}")
+                if e.code in (401, 403, 404, 410):
+                    break
+            except Exception as e:
+                last = e
+            time.sleep(1)
+        raise RuntimeError(f"{dest.name}: {last}")
+
+    def _run(self) -> None:
+        self.ctx.logger(header="Checking for game content updates...")
+        cfg = CONFIG["CONTENT_UPDATE"]
+        root = Path(CONFIG["SERVER"]["EXPORT_DIR"]) / CONFIG["ASSETS"]["CONTENT_SUBDIR"]
+        if not root.is_dir():
+            self.ctx.logger(Logline(f"No game content in {root.absolute()}; nothing to update."))
+            return
+        files = self._loadManifest()
+        if files is None:
+            self.ctx.logger(Logline("No content update list is available; the content from assets.zip is used."))
+            return
+        self.ctx.contentManifest = files
+
+        statePath = Path(cfg["STATE_PATH"])
+        try:
+            state = json.loads(statePath.read_text(encoding="utf-8"))
+            state = state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            state = {}
+        need = []
+        unsafe = checked = 0
+        lastReport = 0.0
+        for rel, entry in files.items():
+            size, sha = entry[0], entry[1]
+            if not self._safe(rel):
+                unsafe += 1
+                continue
+            path = root / rel
+            checked += 1
+            try:
+                st = path.stat()
+            except OSError:
+                st = None
+            if st is not None and st.st_size == size:
+                rec = state.get(rel)
+                if rec and rec[0] == st.st_size and rec[1] == st.st_mtime_ns:
+                    local = rec[2]
+                else:
+                    local = fileSha256(path)
+                    state[rel] = [st.st_size, st.st_mtime_ns, local]
+                if local == sha:
+                    continue
+            need.append((rel, size, sha, path))
+            now = time.monotonic()
+            if now - lastReport >= 0.5:
+                lastReport = now
+                self.ctx.logger(Logline(f"Checking game content: {checked:,} of {len(files):,}", clearLine=True))
+        if unsafe:
+            self.ctx.logger(Logline(f"Ignored {unsafe} entr(ies) of the content list with unsafe paths."))
+        if not need:
+            statePath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            self.ctx.logger(Logline(f"Game content is up to date ({checked:,} files checked)."))
+            return
+
+        total = sum(n[1] for n in need)
+        free = shutil.disk_usage(root).free
+        if total + GB // 4 > free:
+            self.ctx.logger(
+                Logline(
+                    f"The content update needs {formatSize(total)} but only {formatSize(free)}"
+                    " is free; the installed content is used as it is."
+                )
+            )
+            return
+        self.ctx.logger(Logline(f"Downloading {len(need):,} updated file(s), {formatSize(total)}..."))
+        done = failed = 0
+        got = 0
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=cfg["WORKERS"]) as pool:
+            jobs = {
+                pool.submit(self._download, cfg["FILES_BASE"] + sha, sha, path): (rel, sha, path)
+                for rel, size, sha, path in need
+            }
+            for job in as_completed(jobs):
+                rel, sha, path = jobs[job]
+                try:
+                    got += job.result()
+                    st = path.stat()
+                    state[rel] = [st.st_size, st.st_mtime_ns, sha]
+                    done += 1
+                except Exception as e:
+                    failed += 1
+                    if len(errors) < 5:
+                        errors.append(str(e))
+                now = time.monotonic()
+                if now - lastReport >= 0.5:
+                    lastReport = now
+                    self.ctx.logger(
+                        Logline(f"Updating game content: {done + failed:,} of {len(need):,}", clearLine=True)
+                    )
+        statePath.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        self.ctx.logger(
+            Logline(
+                f"Updated {done:,} game content file(s) ({formatSize(got)})."
+                + (
+                    f" {failed:,} could not be downloaded and keep their old version; run the"
+                    f" installer again to retry ({'; '.join(errors)})."
+                    if failed
+                    else ""
+                )
+            )
+        )
+
+
+# FileCrypt, the client's cache scrambling: byte i is stored as (byte + i*i) mod
+# 256. i*i mod 256 repeats every 128 bytes, so 128 strided translate() calls do
+# the whole file at C speed.
+_SCRAMBLE_ADD = [bytes((b + (i * i)) & 0xFF for b in range(256)) for i in range(128)]
+
+
+def fileCryptScramble(data: bytes) -> bytes:
+    out = bytearray(data)
+    for i in range(min(128, len(data))):
+        out[i::128] = data[i::128].translate(_SCRAMBLE_ADD[i])
+    return bytes(out)
+
+
+_LOW_LABEL: tuple | None = None
+
+
+def setLowIntegrityLabel(path: Path) -> None:
+    # Files the game writes itself carry the Low integrity label S:(ML;;NW;;;LW).
+    # A file without it can be read by the game but not replaced or deleted (the
+    # game runs at Low integrity), so every pre-loaded file gets the same label.
+    global _LOW_LABEL
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    if _LOW_LABEL is None:
+        sd = ctypes.c_void_p()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            "S:(ML;;NW;;;LW)", 1, ctypes.byref(sd), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        present, defaulted, sacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+        if not advapi.GetSecurityDescriptorSacl(
+            sd, ctypes.byref(present), ctypes.byref(sacl), ctypes.byref(defaulted)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        _LOW_LABEL = (sd, sacl)  # sd stays alive: sacl points into it
+    advapi.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION = 1, 0x10
+    rc = advapi.SetNamedSecurityInfoW(
+        str(path), SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, None, None, None, _LOW_LABEL[1]
+    )
+    if rc != 0:
+        raise ctypes.WinError(rc)
+
+
+def clientLocalState() -> Path:
+    # The installed client's cache: every file it downloads lands here, flat,
+    # under its file name.
+    return Path(os.environ.get("LOCALAPPDATA", "")) / "Packages" / packageFamilyName() / "LocalState"
+
+
+class SeedClientCache:
+    # Copies the game content into the client's own cache, in the form the client
+    # stores it, so it finds every file already downloaded: no download screens,
+    # and no 15-30 minute first start. The client never re-checks a cached file,
+    # so a re-run also refreshes files whose content changed. Optional: any
+    # problem only means the game downloads its files itself, as before.
+    TEMP_SUFFIX = ".seedtmp"
+
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:
+            self.ctx.logger(
+                Logline(
+                    f"Could not pre-load the game data ({e}). The game will download"
+                    " it the first time it needs it instead."
+                )
+            )
+
+    def _loadMap(self) -> dict | None:
+        cfg = CONFIG["SEED"]
+        dest = Path(cfg["MAP_PATH"])
+        if not (dest.exists() and fileSha256(dest) == cfg["MAP_SHA256"]):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            for url in cfg["MAP_URLS"]:
+                try:
+                    _fetch(self.ctx, url, dest)
+                except Exception as e:
+                    self.ctx.logger(Logline(f"The pre-load list is not available from {url} ({e})"))
+                    continue
+                if fileSha256(dest) == cfg["MAP_SHA256"]:
+                    break
+                dest.unlink(missing_ok=True)
+                self.ctx.logger(Logline(f"The pre-load list from {url} is not the expected file"))
+            else:
+                return None
+        data = json.loads(gzip.decompress(dest.read_bytes()))
+        return data["entries"]
+
+    def _loadState(self, path: Path) -> dict:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _saveState(path: Path, state: dict) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
+
+    _TEXT_MEMBER = re.compile(r"sgtext_[A-Za-z0-9_.-]+\.csv")
+
+    def _loginSources(self, gameContent: Path, taken: set) -> list:
+        # The login's file check downloads two kinds of file that no content
+        # list names, because the client makes them itself:
+        # - the data tables the server announces, mst/Ver<version>_<key>.dat,
+        #   kept as served;
+        # - the text dictionaries, content/sgtext/<name>.zip, which the client
+        #   unpacks into the one .csv it keeps (and deletes the zip).
+        # Both change with every data update, so they are taken from this
+        # content as it is, not from the pinned list. Each source is
+        # (cache name, form, file, zip member or None, state id, size).
+        out = []
+        mst = gameContent / "mst"
+        if mst.is_dir():
+            for src in sorted(mst.glob("Ver*.dat")):
+                if src.is_file() and src.name not in taken:
+                    taken.add(src.name)
+                    out.append((src.name, "raw", src, None, "mst/" + src.name, None))
+        sgtext = gameContent / "content" / "sgtext"
+        if sgtext.is_dir():
+            for src in sorted(sgtext.glob("sgtext_*.zip")):
+                try:
+                    with zipfile.ZipFile(src) as zf:
+                        members = [i for i in zf.infolist() if self._TEXT_MEMBER.fullmatch(i.filename)]
+                except (OSError, zipfile.BadZipFile):
+                    continue
+                for info in members:
+                    if info.filename not in taken:
+                        taken.add(info.filename)
+                        out.append(
+                            (info.filename, "raw", src, info.filename,
+                             f"content/sgtext/{src.name}:{info.filename}", info.file_size)
+                        )
+        return out
+
+    def _run(self) -> None:
+        self.ctx.logger(header="Pre-loading the game data...")
+        if any(runningProcessPaths(CONFIG["APPX"]["PROCESS"])):
+            self.ctx.logger(
+                Logline(
+                    "Brave Frontier is running, so its data was not pre-loaded. Close it"
+                    " and run the installer again to pre-load it."
+                )
+            )
+            return
+        localState = clientLocalState()
+        if not localState.is_dir():
+            # Created by Windows for the installed app; never by the installer,
+            # which would give it the wrong permissions.
+            self.ctx.logger(
+                Logline(
+                    "The game's data folder does not exist yet, so nothing was pre-loaded."
+                    " Start Brave Frontier once, close it, then run the installer again"
+                    " to pre-load the game data (or let the game download it)."
+                )
+            )
+            return
+        content = (
+            Path(CONFIG["SERVER"]["EXPORT_DIR"]) / CONFIG["ASSETS"]["CONTENT_SUBDIR"] / "content"
+        )
+        if not content.is_dir():
+            self.ctx.logger(Logline(f"No game content in {content.absolute()}; nothing to pre-load."))
+            return
+        entries = self._loadMap()
+        if entries is None:
+            self.ctx.logger(
+                Logline("The pre-load list could not be downloaded; the game will download its data itself.")
+            )
+            return
+        # Files added since the pinned list was made (content updates, homebrew
+        # packs) carry their cache form in the content list: pre-load those too.
+        # The pinned list keeps its own choice for every name it already has.
+        for rel, entry in (self.ctx.contentManifest or {}).items():
+            form = entry[2] if len(entry) > 2 else None
+            if form not in ("raw", "scrambled") or not rel.startswith("content/"):
+                continue
+            name = rel.rsplit("/", 1)[-1]
+            if name not in entries:
+                entries[name] = [rel[len("content/"):], form, entry[0], entry[1]]
+        # Homebrew packs installed on this computer record their files' forms too.
+        packForms = Path(CONFIG["SERVER"]["EXPORT_DIR"]) / CONFIG["ASSETS"]["CONTENT_SUBDIR"] / "packs" / "forms.json"
+        try:
+            for name, entry in json.loads(packForms.read_text(encoding="utf-8")).items():
+                if entry[1] in ("raw", "scrambled") and name not in entries:
+                    entries[name] = entry
+        except (OSError, ValueError, TypeError, IndexError):
+            pass
+
+        for leftover in localState.glob("*" + self.TEMP_SUFFIX):
+            leftover.unlink(missing_ok=True)
+
+        statePath = Path(CONFIG["SEED"]["STATE_PATH"])
+        state = self._loadState(statePath)
+        # Each entry: [content-relative path, "raw" | "scrambled", size, sha256].
+        sources = [(name, e[1], content / e[0], None, e[0], None) for name, e in entries.items()]
+        sources += self._loginSources(content.parent, set(entries))
+        todo = []
+        unchanged = missingSource = 0
+        for name, form, src, member, sourceId, size in sources:
+            try:
+                sst = src.stat()
+            except OSError:
+                missingSource += 1
+                continue
+            dest = localState / name
+            try:
+                dst = dest.stat()
+            except OSError:
+                dst = None
+            stamp = [sourceId, form, sst.st_size, sst.st_mtime_ns]
+            if dst is not None and state.get(name) == stamp + [dst.st_size, dst.st_mtime_ns]:
+                unchanged += 1
+                continue
+            todo.append((name, form, src, member, size if size is not None else sst.st_size, dest, stamp, dst))
+
+        need = sum(s[4] for s in todo if s[7] is None)
+        free = shutil.disk_usage(localState).free
+        if need + CONFIG["SEED"]["FREE_MARGIN"] > free:
+            self.ctx.logger(
+                Logline(
+                    f"Pre-loading needs {formatSize(need)} but only {formatSize(free)} is"
+                    " free, so nothing was pre-loaded. Free some space and run the"
+                    " installer again, or let the game download its data."
+                )
+            )
+            return
+
+        written = same = 0
+        writtenBytes = 0
+        lastReport = 0.0
+        for i, (name, form, src, member, _, dest, stamp, dst) in enumerate(todo, 1):
+            if member is None:
+                data = src.read_bytes()
+            else:
+                with zipfile.ZipFile(src) as zf:
+                    data = zf.read(member)
+            want = fileCryptScramble(data) if form == "scrambled" else data
+            if dst is not None and dst.st_size == len(want) and dest.read_bytes() == want:
+                same += 1
+            else:
+                tmp = dest.with_name(dest.name + self.TEMP_SUFFIX)
+                tmp.write_bytes(want)
+                setLowIntegrityLabel(tmp)
+                os.replace(tmp, dest)
+                written += 1
+                writtenBytes += len(want)
+            now = dest.stat()
+            state[name] = stamp + [now.st_size, now.st_mtime_ns]
+            if i % 5000 == 0:
+                self._saveState(statePath, state)  # an interrupted run resumes here
+            t = time.monotonic()
+            if t - lastReport >= 0.5:
+                lastReport = t
+                self.ctx.logger(
+                    Logline(f"Pre-loading: {i:,} of {len(todo):,} files checked", clearLine=True)
+                )
+        self._saveState(statePath, state)
+        self.ctx.seededFiles = written + same + unchanged
+        self.ctx.logger(
+            Logline(
+                f"Pre-loaded the game data: {written:,} file(s) written"
+                f" ({formatSize(writtenBytes)}), {same + unchanged:,} already in place."
+                + (
+                    f" {missingSource:,} listed file(s) are not in this content and will"
+                    " download if the game needs them."
+                    if missingSource
+                    else ""
+                )
+            )
+        )
+
+
 class App:
 
     def __init__(self, root: tk.Tk):
@@ -1640,7 +2122,7 @@ class App:
                     TrustCertAndEnableLoopback,
                     PatchGameClient,
                 ]
-            for work in steps + [SetupGameServer]:
+            for work in steps + [SetupGameServer, UpdateGameContent, SeedClientCache]:
                 work(ctx=ctx).run()
         except Exception as e:
             errored = True
@@ -1677,10 +2159,16 @@ class App:
             "\nYou have now completed the entire installation process of DecompFrontier!\n"
             f"1. Start the server: open {launch.absolute()} and leave its window open"
             " while you play.\n"
-            "2. Start Brave Frontier from the Start menu. The first start downloads the"
-            " game data from your server, which can take 30 minutes or more. (Opening"
-            " a BraveFrontier.Windows.exe file directly fails with \"msvcr120_app.dll"
-            " was not found\": Windows supplies that DLL only to the installed app.)\n"
+            "2. Start Brave Frontier from the Start menu."
+            + (
+                " Its game data was pre-loaded, so it starts without the long download."
+                if ctx.seededFiles
+                else " The first start downloads the game data from your server, which"
+                " can take 30 minutes or more."
+            )
+            + " (Opening a BraveFrontier.Windows.exe file directly fails with"
+            " \"msvcr120_app.dll was not found\": Windows supplies that DLL only to the"
+            " installed app.)\n"
             + (
                 "\nAnother Brave Frontier, not made by this installer, is also installed"
                 " and cannot reach your server. To remove it, run this in PowerShell:\n"
